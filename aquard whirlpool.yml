@@ -1,0 +1,231 @@
+# ============================================================================
+# Aquard Whirlpool – required helpers package
+# ============================================================================
+# This package provides all input_helpers, timers, and template sensors
+# needed for the time-based scheduling features of this Aquard fork
+# (pre-heating, filtration tracking, dosing recommendations).
+#
+# INSTALLATION:
+# 1. Make sure packages are enabled in your configuration.yaml:
+#
+#      homeassistant:
+#        packages: !include_dir_named packages
+#
+# 2. Save this file as: packages/aquard_whirlpool.yaml
+# 3. Restart Home Assistant (packages are not hot-reloadable).
+#
+# NOTE: Adjust the following entity references to match your own setup
+# before restarting:
+#   - calendar.whirlpool                                     (your calendar)
+#   - climate.layzspa_wifi_controller_layzspa_temperature_control (your spa climate entity)
+#   - sensor.wasserqualitat_sensor_ph                         (your pH sensor)
+#   - sensor.wasserqualitat_sensor_oxidation_reduction_potential (your ORP sensor)
+#   - volume_l = 650                                          (your spa's water volume in litres)
+# ============================================================================
+
+input_boolean:
+  whirlpool_auto_aktiv:
+    name: "Whirlpool Auto aktiv"
+    initial: true
+  whirlpool_manuell_heizen:
+    name: "Whirlpool Manuell heizen"
+    initial: false
+  whirlpool_kalender_vorheizen_aktiv:
+    name: "Whirlpool Kalender-Vorheizen aktiv"
+    initial: true
+
+input_number:
+  whirlpool_filter_soll_minuten:
+    name: "Whirlpool Filter Soll Minuten"
+    min: 0
+    max: 300
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+  whirlpool_filter_credit_heute:
+    name: "Whirlpool Filter Credit heute"
+    min: 0
+    max: 600
+    step: 1
+    unit_of_measurement: "min"
+    mode: slider
+  whirlpool_vorheiz_reserve_minuten:
+    name: "Whirlpool Vorheiz Reserve Minuten"
+    min: 0
+    max: 180
+    step: 5
+    unit_of_measurement: "min"
+    mode: slider
+  whirlpool_heizrate_grad_pro_stunde:
+    name: "Whirlpool Heizrate Grad pro Stunde"
+    min: 1
+    max: 2
+    step: 0.1
+    unit_of_measurement: "°C/h"
+    mode: slider
+  whirlpool_heizen_auf_zeit_dauer:
+    name: "Whirlpool Heizen auf Zeit Dauer"
+    min: 15
+    max: 240
+    step: 15
+    unit_of_measurement: "min"
+    mode: slider
+
+timer:
+  whirlpool_filtern_timer:
+    name: "Whirlpool Filtern Timer"
+    icon: mdi:filter
+    duration: "00:15:00"
+    restore: true
+  whirlpool_heizen_auf_zeit_timer:
+    name: "Whirlpool Heizen auf Zeit Timer"
+    duration: "01:00:00"
+    restore: true
+
+# ----------------------------------------------------------------------------
+# Smoothed water-quality sensors (1-minute moving average)
+# ----------------------------------------------------------------------------
+sensor:
+  - platform: filter
+    name: "Whirlpool pH geglättet"
+    entity_id: sensor.wasserqualitat_sensor_ph
+    filters:
+      - filter: time_simple_moving_average
+        window_size:
+          minutes: 1
+        precision: 2
+
+  - platform: filter
+    name: "Whirlpool ORP geglättet"
+    entity_id: sensor.wasserqualitat_sensor_oxidation_reduction_potential
+    filters:
+      - filter: time_simple_moving_average
+        window_size:
+          minutes: 1
+        precision: 2
+
+# ----------------------------------------------------------------------------
+# Template sensors / binary sensors
+# ----------------------------------------------------------------------------
+template:
+  - sensor:
+      - name: "Whirlpool Filter Rest Minuten"
+        unique_id: whirlpool_filter_rest_minuten
+        unit_of_measurement: "min"
+        state: >
+          {{ max((states('input_number.whirlpool_filter_soll_minuten') | float(0))
+             - (states('input_number.whirlpool_filter_credit_heute') | float(0)), 0) }}
+
+      - name: "Whirlpool Naechster Termin Start"
+        unique_id: whirlpool_naechster_termin_start
+        state: >
+          {% set start = state_attr('calendar.whirlpool', 'start_time') %}
+          {{ start if start not in [none, 'unknown', 'unavailable'] else 'unknown' }}
+
+      - name: "Whirlpool Vorheiz Startzeit"
+        unique_id: whirlpool_vorheiz_startzeit
+        state: >
+          {% set start = state_attr('calendar.whirlpool', 'start_time') %}
+          {% set ist_raw = state_attr('climate.layzspa_wifi_controller_layzspa_temperature_control', 'current_temperature') %}
+          {% if start not in [none, 'unknown', 'unavailable'] and ist_raw is not none %}
+            {% set ist = ist_raw | float(0) %}
+            {% set ziel = state_attr('climate.layzspa_wifi_controller_layzspa_temperature_control', 'temperature') | float(30) %}
+            {% set diff = [ziel - ist, 0] | max %}
+            {% set rate = states('input_number.whirlpool_heizrate_grad_pro_stunde') | float(2.0) %}
+            {% set vorheizstunden = 0 if rate <= 0 else (diff / rate) %}
+            {% set reserve = states('input_number.whirlpool_vorheiz_reserve_minuten') | float(30) %}
+            {{ (as_datetime(start) - timedelta(hours=vorheizstunden) - timedelta(minutes=reserve)) }}
+          {% else %}
+            unknown
+          {% endif %}
+
+      - name: "Whirlpool Naechste Aktion"
+        unique_id: whirlpool_naechste_aktion
+        state: >
+          {% set now_ts = as_timestamp(now()) %}
+          {% set filter_slots = ['09:00:00','15:00:00','21:00:00'] %}
+          {% set today_str = now().strftime('%Y-%m-%d') %}
+          {% set candidates = [] %}
+          {% for t in filter_slots %}
+            {% set ts = as_timestamp(today_str ~ ' ' ~ t) %}
+            {% if ts > now_ts %}
+              {% set candidates = candidates + [ts] %}
+            {% endif %}
+          {% endfor %}
+          {% if candidates | count > 0 %}
+            {% set next_filter_ts = candidates | min %}
+          {% else %}
+            {% set tomorrow_str = (now() + timedelta(days=1)).strftime('%Y-%m-%d') %}
+            {% set next_filter_ts = as_timestamp(tomorrow_str ~ ' 09:00:00') %}
+          {% endif %}
+          {% set heat_raw = states('sensor.whirlpool_vorheiz_startzeit') %}
+          {% set next_heat_ts = as_timestamp(heat_raw) if heat_raw not in ['unknown','unavailable',''] else None %}
+          {% if next_heat_ts is not none and next_heat_ts > now_ts and is_state('input_boolean.whirlpool_kalender_vorheizen_aktiv','on') and next_heat_ts < next_filter_ts %}
+            Heizen ab {{ (next_heat_ts | timestamp_custom('%H:%M', true)) }} Uhr
+          {% else %}
+            Filtern um {{ (next_filter_ts | timestamp_custom('%H:%M', true)) }} Uhr
+          {% endif %}
+
+      - name: "Whirlpool Zeit bis fertig"
+        unique_id: whirlpool_zeit_bis_fertig
+        unit_of_measurement: "h"
+        state: >
+          {% set cur = state_attr('climate.layzspa_wifi_controller_layzspa_temperature_control','current_temperature') %}
+          {% set tgt = state_attr('climate.layzspa_wifi_controller_layzspa_temperature_control','temperature') %}
+          {% if cur is not none and tgt is not none %}
+            {% set rate = states('input_number.whirlpool_heizrate_grad_pro_stunde')|float(2.0) %}
+            {% set diff = tgt|float - cur|float %}
+            {{ 0 if diff <= 0 or rate <= 0 else (diff / rate) | round(2) }}
+          {% endif %}
+
+  - binary_sensor:
+      - name: "Whirlpool Vorheizen noetig"
+        unique_id: whirlpool_vorheizen_noetig
+        state: >
+          {{ is_state('input_boolean.whirlpool_auto_aktiv','on')
+             and is_state('input_boolean.whirlpool_kalender_vorheizen_aktiv','on')
+             and state_attr('calendar.whirlpool','start_time') not in [none,'unknown','unavailable']
+             and states('sensor.whirlpool_vorheiz_startzeit') not in ['unknown','unavailable']
+             and (as_timestamp(now()) >= as_timestamp(as_datetime(states('sensor.whirlpool_vorheiz_startzeit'))))
+             and (as_timestamp(now()) < as_timestamp(as_datetime(state_attr('calendar.whirlpool','start_time'))))
+             and (state_attr('climate.layzspa_wifi_controller_layzspa_temperature_control','current_temperature') is not none)
+             and (state_attr('climate.layzspa_wifi_controller_layzspa_temperature_control','current_temperature')|float(0)
+                  < state_attr('climate.layzspa_wifi_controller_layzspa_temperature_control','temperature')|float(30)) }}
+
+      - name: "Whirlpool Filter nachholen noetig"
+        unique_id: whirlpool_filter_nachholen_noetig
+        state: >
+          {{ is_state('input_boolean.whirlpool_auto_aktiv','on')
+             and (states('sensor.whirlpool_filter_rest_minuten') | float(0) > 0)
+             and is_state('input_boolean.whirlpool_manuell_heizen','off') }}
+
+      - name: "Whirlpool Wasserpflege noetig"
+        unique_id: whirlpool_wasserpflege_noetig
+        state: >
+          {% set volume_l = 650 %}
+          {% set ph = states('sensor.wasserqualitat_sensor_ph') | float(0) %}
+          {% set orp = states('sensor.wasserqualitat_sensor_oxidation_reduction_potential') | float(0) %}
+          {% set ph_target_min = 7.2 %}
+          {% set ph_target_max = 7.4 %}
+          {% set ph_correct_to = 7.3 %}
+          {% set orp_alert_threshold = 650 %}
+          {% set min_gram = 5 %}
+          {% set volume_m3 = volume_l / 1000 %}
+          {% set ph_minus_g = ((ph - ph_correct_to) / 0.1 * 100 * (volume_m3/10)) if ph > ph_target_max else 0 %}
+          {% set ph_plus_g = ((ph_correct_to - ph) / 0.1 * 100 * (volume_m3/10)) if ph < ph_target_min else 0 %}
+          {% set target_fc = 0.6 %}
+          {% if ph <= 7.1 %}
+            {% set fc_est = 0.5 + ((orp-715)/18) %}
+          {% elif ph <= 7.3 %}
+            {% set fc_est = 0.5 + ((orp-703)/18) %}
+          {% elif ph <= 7.5 %}
+            {% set fc_est = 0.5 + ((orp-691)/18) %}
+          {% elif ph <= 7.7 %}
+            {% set fc_est = 0.5 + ((orp-679)/18) %}
+          {% else %}
+            {% set fc_est = 0.5 + ((orp-667)/18) %}
+          {% endif %}
+          {% set fc_est = [fc_est,0]|max %}
+          {% set delta_fc = [target_fc - fc_est, 0]|max %}
+          {% set chlor_g = (delta_fc * volume_l)/560 if orp < orp_alert_threshold else 0 %}
+          {{ (ph_minus_g >= min_gram) or (ph_plus_g >= min_gram) or (chlor_g >= min_gram) }}
